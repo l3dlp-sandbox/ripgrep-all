@@ -143,23 +143,25 @@ async fn adapt_caching(
         ai.filepath_hint.to_string_lossy(),
         &meta.name
     );
+    // Note: adapt_caching is only called from rga_preproc for the top-level file.
+    // Recursive files inside archives go through loop_adapt directly and never hit this function,
+    // so in practice only --rga-no-cache triggers the None path here (is_real_file is always true).
+    let mut cache = if ai.is_real_file && !ai.config.cache.disabled {
+        open_cache_db(Path::new(&ai.config.cache.path.0)).await?
+    } else {
+        debug!("cache disabled, running adapter without caching...");
+        let inp = loop_adapt(adapter.as_ref(), detection_reason, ai).await?;
+        return Ok(Box::pin(concat_read_streams(inp)));
+    };
     let cache_compression_level = ai.config.cache.compression_level;
     let cache_max_blob_len = ai.config.cache.max_blob_len;
 
-    let cache = if ai.is_real_file && !ai.config.cache.disabled {
-        Some(open_cache_db(Path::new(&ai.config.cache.path.0)).await?)
-    } else {
-        None
-    };
-
-    let mut cache = cache.context("No cache?")?;
     let cache_key = CacheKey::new(
         ai.postprocess,
         &ai.filepath_hint,
         adapter.as_ref(),
         &active_adapters,
     )?;
-    // let dbg_ctx = format!("adapter {}", &adapter.metadata().name);
     let cached = cache.get(&cache_key).await.context("cache.get")?;
     match cached {
         Some(cached) => Ok(Box::pin(ZstdDecoder::new(Cursor::new(cached)))),
