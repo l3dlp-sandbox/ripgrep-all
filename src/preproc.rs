@@ -143,52 +143,62 @@ async fn adapt_caching(
         ai.filepath_hint.to_string_lossy(),
         &meta.name
     );
-    let cache_compression_level = ai.config.cache.compression_level;
-    let cache_max_blob_len = ai.config.cache.max_blob_len;
-
     let cache = if ai.is_real_file && !ai.config.cache.disabled {
         Some(open_cache_db(Path::new(&ai.config.cache.path.0)).await?)
     } else {
         None
     };
 
-    let mut cache = cache.context("No cache?")?;
-    let cache_key = CacheKey::new(
-        ai.postprocess,
-        &ai.filepath_hint,
-        adapter.as_ref(),
-        &active_adapters,
-    )?;
-    // let dbg_ctx = format!("adapter {}", &adapter.metadata().name);
-    let cached = cache.get(&cache_key).await.context("cache.get")?;
-    match cached {
-        Some(cached) => Ok(Box::pin(ZstdDecoder::new(Cursor::new(cached)))),
+    match cache {
+        Some(mut cache) => {
+            let cache_compression_level = ai.config.cache.compression_level;
+            let cache_max_blob_len = ai.config.cache.max_blob_len;
+            let cache_key = CacheKey::new(
+                ai.postprocess,
+                &ai.filepath_hint,
+                adapter.as_ref(),
+                &active_adapters,
+            )?;
+            let cached = cache.get(&cache_key).await.context("cache.get")?;
+            match cached {
+                Some(cached) => Ok(Box::pin(ZstdDecoder::new(Cursor::new(cached)))),
+                None => {
+                    debug!("cache MISS, running adapter with caching...");
+                    let inp = loop_adapt(adapter.as_ref(), detection_reason, ai).await?;
+                    let inp = concat_read_streams(inp);
+                    let inp = async_read_and_write_to_cache(
+                        inp,
+                        cache_max_blob_len.0,
+                        cache_compression_level.0,
+                        Box::new(move |(uncompressed_size, compressed)| {
+                            Box::pin(async move {
+                                debug!(
+                                    "uncompressed output: {}",
+                                    print_bytes(uncompressed_size as f64)
+                                );
+                                if let Some(cached) = compressed {
+                                    debug!(
+                                        "compressed output: {}",
+                                        print_bytes(cached.len() as f64)
+                                    );
+                                    cache
+                                        .set(&cache_key, cached)
+                                        .await
+                                        .context("writing to cache")?
+                                }
+                                Ok(())
+                            })
+                        }),
+                    )?;
+
+                    Ok(Box::pin(inp))
+                }
+            }
+        }
         None => {
-            debug!("cache MISS, running adapter with caching...");
+            debug!("cache disabled, running adapter without caching...");
             let inp = loop_adapt(adapter.as_ref(), detection_reason, ai).await?;
             let inp = concat_read_streams(inp);
-            let inp = async_read_and_write_to_cache(
-                inp,
-                cache_max_blob_len.0,
-                cache_compression_level.0,
-                Box::new(move |(uncompressed_size, compressed)| {
-                    Box::pin(async move {
-                        debug!(
-                            "uncompressed output: {}",
-                            print_bytes(uncompressed_size as f64)
-                        );
-                        if let Some(cached) = compressed {
-                            debug!("compressed output: {}", print_bytes(cached.len() as f64));
-                            cache
-                                .set(&cache_key, cached)
-                                .await
-                                .context("writing to cache")?
-                        }
-                        Ok(())
-                    })
-                }),
-            )?;
-
             Ok(Box::pin(inp))
         }
     }
